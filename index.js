@@ -6,17 +6,18 @@ const WebSocket = require('ws');
 const crypto = require('crypto');
 const fs = require('fs').promises;
 const kleur = require('kleur');
-const banner = require('./banner');
 
 // Configuration
 const config = {
   tokens: [],
+  proxies: [],
+  proxyGroups: {},
+  currentProxyIndices: {},
   baseUrl: "https://app.despeed.net",
   checkInterval: 60000,
   proxy: {
     enabled: false,
     type: "http",
-    url: "",
     timeout: 10000,
     maxRetries: 3,
     testUrl: "https://api.ipify.org?format=json"
@@ -35,7 +36,7 @@ const logger = {
   network: (msg) => console.log(kleur.blue('🌐'), kleur.white(msg))
 };
 
-// Read tokens from file
+// Load tokens from file
 async function loadTokensFromFile() {
   try {
     const content = await fs.readFile('token.txt', 'utf8');
@@ -60,66 +61,108 @@ async function loadTokensFromFile() {
   }
 }
 
-// Read proxy from file
+// Load proxy from file
 async function loadProxyFromFile() {
   try {
     const proxyContent = await fs.readFile('proxy.txt', 'utf8');
-    const proxyUrl = proxyContent.trim();
+    const proxies = proxyContent.split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
     
-    if (!proxyUrl) {
+    if (proxies.length === 0) {
+      logger.error('proxy.txt file has no valid proxies');
       return null;
     }
 
-    if (proxyUrl.startsWith('http://') || proxyUrl.startsWith('https://')) {
-      config.proxy.type = 'http';
-      config.proxy.url = proxyUrl;
-    } else if (proxyUrl.startsWith('socks4://')) {
-      config.proxy.type = 'socks4';
-      config.proxy.url = proxyUrl;
-    } else if (proxyUrl.startsWith('socks5://')) {
-      config.proxy.type = 'socks5';
-      config.proxy.url = proxyUrl;
-    } else {
-      config.proxy.type = 'http';
-      config.proxy.url = `http://${proxyUrl}`;
-    }
+    // Convert proxy URL format
+    config.proxies = proxies.map(proxyUrl => {
+      // Convert smartproxy format to http proxy URL
+      if (!proxyUrl.startsWith('http://') && !proxyUrl.startsWith('https://')) {
+        return `http://${proxyUrl}`;
+      }
+      return proxyUrl;
+    });
 
+    logger.success(`Loaded ${config.proxies.length} proxies successfully`);
+    logger.info('Proxy format example:');
+    logger.info(`- Original: ${proxies[0]}`);
+    logger.info(`- Converted: ${config.proxies[0]}`);
+    
+    config.proxy.enabled = true;
     return true;
   } catch (error) {
-    if (error.code !== 'ENOENT') {
+    if (error.code === 'ENOENT') {
+      logger.error('proxy.txt file not found');
+    } else {
       logger.error(`Error reading proxy file: ${error.message}`);
     }
     return null;
   }
 }
 
-// Create proxy agent based on type
-async function createProxyAgent() {
-  if (!config.proxy.url) {
-    return undefined;
+// Setup proxy groups function
+async function setupProxyGroups(tokens, proxies) {
+  if (!proxies || proxies.length === 0) {
+    logger.error('No available proxies');
+    return;
   }
 
-  try {
-    if (config.proxy.type === 'http') {
-      return new HttpsProxyAgent({
-        proxy: config.proxy.url,
-        timeout: config.proxy.timeout,
-        keepAlive: true,
-        maxFreeSockets: 256,
-        maxSockets: 256
-      });
-    } else {
-      return new SocksProxyAgent({
-        proxy: config.proxy.url,
-        timeout: config.proxy.timeout,
-        keepAlive: true,
-        type: config.proxy.type === 'socks4' ? 4 : 5
-      });
-    }
-  } catch (error) {
-    logger.error(`Failed to create proxy agent: ${error.message}`);
-    return undefined;
+  logger.info(`Token count: ${tokens.length}, Proxy count: ${proxies.length}`);
+  
+  // Calculate proxies per token (even distribution)
+  const proxiesPerToken = Math.floor(proxies.length / tokens.length);
+  const remainingProxies = proxies.length % tokens.length;
+  
+  logger.info('Proxy distribution method:');
+  logger.info(`- Base allocation per token: ${proxiesPerToken}`);
+  if (remainingProxies > 0) {
+    logger.info(`- Additional proxies to be assigned to last token: ${remainingProxies}`);
+    logger.info(`- Total proxies assigned to last token: ${proxiesPerToken + remainingProxies}`);
   }
+  
+  tokens.forEach((token, index) => {
+    const startIndex = index * proxiesPerToken;
+    const endIndex = index === tokens.length - 1 
+      ? proxies.length  // Last token will receive all remaining proxies
+      : startIndex + proxiesPerToken;
+    
+    config.proxyGroups[token] = proxies.slice(startIndex, endIndex);
+    config.currentProxyIndices[token] = 0;
+  });
+
+  // Print configured group information
+  logger.success('Proxy group setup completed:');
+  tokens.forEach((token, index) => {
+    logger.info(`Token ${index + 1}: ${config.proxyGroups[token].length} proxies assigned`);
+  });
+}
+
+// Get next proxy for token
+function getNextProxyForToken(token) {
+  if (!token || !config.proxyGroups || !config.proxyGroups[token]) {
+    return config.proxies[0]; // Return default value as first proxy
+  }
+  
+  const proxyGroup = config.proxyGroups[token];
+  const currentIndex = config.currentProxyIndices[token] || 0;
+  const proxy = proxyGroup[currentIndex];
+  
+  // Cycle to next index
+  config.currentProxyIndices[token] = (currentIndex + 1) % proxyGroup.length;
+  
+  return proxy;
+}
+
+// Create proxy agent function
+async function createProxyAgent(token) {
+  if (!config.proxy.enabled) return undefined;
+  
+  const proxyUrl = getNextProxyForToken(token);
+  if (!proxyUrl) return undefined;
+
+  // Remove http:// and recreate
+  const cleanUrl = proxyUrl.replace('http://', '');
+  return new HttpsProxyAgent(`http://${cleanUrl}`);
 }
 
 // Check proxy availability
@@ -136,28 +179,28 @@ async function isProxyAlive(proxyAgent) {
 }
 
 // Get working proxy agent with retries
-async function getProxyAgent(retries = config.proxy.maxRetries) {
+async function getProxyAgent(token, retries = config.proxy.maxRetries) {
   if (!config.proxy.enabled) return undefined;
 
   for (let i = 0; i < retries; i++) {
     try {
-      const agent = await createProxyAgent();
+      const agent = await createProxyAgent(token);
       if (!agent) {
         return undefined;
       }
 
       if (await isProxyAlive(agent)) {
-        logger.success(`Proxy connection established (${config.proxy.type})`);
+        logger.success(`Proxy connection successful`);
         return agent;
       }
 
-      logger.warning(`Proxy check failed, attempt ${i + 1}/${retries}`);
+      logger.warning(`Proxy check failed, retrying ${i + 1}/${retries}`);
       await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
 
     } catch (error) {
       logger.error(`Proxy error (${i + 1}/${retries}): ${error.message}`);
       if (i === retries - 1) {
-        throw new Error('Maximum proxy retry attempts reached');
+        throw new Error('Maximum proxy retry count reached');
       }
     }
   }
@@ -185,7 +228,7 @@ function generateRandomLocation() {
 
 // Initialize configuration
 async function initConfig() {
-  logger.info('Starting configuration setup...');
+  logger.info('Initializing configuration...');
 
   const tokensLoaded = await loadTokensFromFile();
   if (!tokensLoaded) {
@@ -194,8 +237,30 @@ async function initConfig() {
 
   const proxyFileExists = await loadProxyFromFile();
   if (proxyFileExists) {
-    logger.success('Loaded proxy configuration from proxy.txt');
+    logger.success('Loaded proxy settings from proxy.txt');
     config.proxy.enabled = true;
+    
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    logger.info(`\nProxy distribution information:`);
+    logger.info(`- Total tokens: ${config.tokens.length}`);
+    logger.info(`- Total proxies: ${config.proxies.length}`);
+    logger.info(`- Base allocation per token: ${Math.floor(config.proxies.length / config.tokens.length)}`);
+    if (config.proxies.length % config.tokens.length > 0) {
+      logger.info(`- Last token will receive additional ${config.proxies.length % config.tokens.length} proxies`);
+    }
+    
+    await new Promise((resolve) => {
+      rl.question('\nPress Enter to continue with this distribution method.', () => {
+        rl.close();
+        resolve();
+      });
+    });
+    
+    await setupProxyGroups(config.tokens, config.proxies);
   } else {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -204,7 +269,7 @@ async function initConfig() {
 
     const question = (query) => new Promise((resolve) => rl.question(query, resolve));
 
-    const useProxy = (await question(kleur.cyan('Use proxy? (y/n): '))).toLowerCase() === 'y';
+    const useProxy = (await question(kleur.cyan('Do you want to use a proxy? (y/n): '))).toLowerCase() === 'y';
     if (useProxy) {
       config.proxy.enabled = true;
       const proxyUrl = await question(kleur.cyan('Enter proxy URL (e.g., http://user:pass@ip:port or socks5://ip:port): '));
@@ -231,7 +296,7 @@ async function initConfig() {
   console.log(kleur.gray(JSON.stringify(safeConfig, null, 2)));
 }
 
-// Get common headers
+// General header fetching
 function getCommonHeaders(token) {
   return {
     'Authorization': `Bearer ${token}`,
@@ -248,7 +313,7 @@ function getCommonHeaders(token) {
   };
 }
 
-// Validate token
+// Token validity check
 async function validateToken(token) {
   if (!token) {
     throw new Error('Token not found');
@@ -260,7 +325,7 @@ async function validateToken(token) {
       throw new Error('Token expired');
     }
 
-    const proxyAgent = await getProxyAgent();
+    const proxyAgent = await getProxyAgent(token);
     const profileResponse = await fetch(`${config.baseUrl}/v1/api/auth/profile`, {
       headers: getCommonHeaders(token),
       agent: proxyAgent,
@@ -268,7 +333,7 @@ async function validateToken(token) {
     });
 
     if (!profileResponse.ok) {
-      throw new Error('Token invalid');
+      throw new Error('Invalid token');
     }
 
     return true;
@@ -293,14 +358,14 @@ async function performSpeedTest() {
     const locateUrl = new URL('https://locate.measurementlab.net/v2/nearest/ndt/ndt7');
     locateUrl.search = new URLSearchParams(metadata).toString();
     
-    logger.info('Locating speed test server...');
+    logger.info('Finding speed test server...');
     const locateResponse = await fetch(locateUrl, {
       agent: proxyAgent,
       timeout: 30000
     });
 
     if (!locateResponse.ok) {
-      throw new Error(`Failed to get speed test server: ${locateResponse.status}`);
+      throw new Error(`Failed to find speed test server: ${locateResponse.status}`);
     }
 
     const serverData = await locateResponse.json();
@@ -357,7 +422,7 @@ async function performSpeedTest() {
       });
     });
 
-    // Upload test with fixes
+    // Upload test
     logger.network('Starting upload test...');
     let uploadSpeed = 0;
     await new Promise((resolve) => {
@@ -463,11 +528,12 @@ async function performSpeedTest() {
   }
 }
 
+// Report results
 async function reportResults(token, downloadSpeed, uploadSpeed, location) {
   try {
     logger.info('Submitting test results...');
 
-    const proxyAgent = await getProxyAgent();
+    const proxyAgent = await getProxyAgent(token);
     const response = await fetch(`${config.baseUrl}/v1/api/points`, {
       method: 'POST',
       headers: {
@@ -486,7 +552,7 @@ async function reportResults(token, downloadSpeed, uploadSpeed, location) {
     });
 
     if (!response.ok) {
-      throw new Error(`Report failed: ${response.status}`);
+      throw new Error(`Failed to submit results: ${response.status}`);
     }
     
     const data = await response.json();
@@ -495,7 +561,7 @@ async function reportResults(token, downloadSpeed, uploadSpeed, location) {
       logger.success('Results submitted successfully');
       return data;
     } else {
-      throw new Error(data.message || 'Report failed');
+      throw new Error(data.message || 'Failed to submit results');
     }
 
   } catch (error) {
@@ -509,7 +575,7 @@ async function displayAccountInfo(token) {
   try {
     logger.info('\n=== Account Information ===');
     
-    const proxyAgent = await getProxyAgent();
+    const proxyAgent = await getProxyAgent(token);
     const profileResponse = await fetch(`${config.baseUrl}/v1/api/auth/profile`, {
       headers: getCommonHeaders(token),
       agent: proxyAgent,
@@ -522,13 +588,13 @@ async function displayAccountInfo(token) {
       logger.info(`Email: ${profile.data.email || "Not set"}`);
     }
     
-    logger.info('=== ==================== ===\n');
+    logger.info('=== ============ ===\n');
   } catch (error) {
-    logger.error(`Failed to get account information: ${error.message}`);
+    logger.error(`Error getting account information: ${error.message}`);
   }
 }
 
-// Process single account
+// Single account processing
 async function processAccount(token, accountIndex) {
   try {
     logger.info(`\n=== Processing Account ${accountIndex + 1} ===`);
@@ -548,8 +614,8 @@ async function processAccount(token, accountIndex) {
     
     logger.network('Starting speed test...');
     const { downloadSpeed, uploadSpeed } = await performSpeedTest();
-    logger.speed(`Final Download speed: ${downloadSpeed.toFixed(2)} Mbps`);
-    logger.speed(`Final Upload speed: ${uploadSpeed.toFixed(2)} Mbps`);
+    logger.speed(`Final download speed: ${downloadSpeed.toFixed(2)} Mbps`);
+    logger.speed(`Final upload speed: ${uploadSpeed.toFixed(2)} Mbps`);
     
     const result = await reportResults(token, downloadSpeed, uploadSpeed, location);
     
@@ -581,43 +647,41 @@ async function processAccount(token, accountIndex) {
 // Main loop
 async function main() {
   try {
-    logger.info('\n=== Starting multi-account speed test ===');
+    logger.info('\n=== Starting Multi-Account Speed Test ===');
     
     for (let i = 0; i < config.tokens.length; i++) {
       await processAccount(config.tokens[i], i);
       
-      // Add delay between accounts
       if (i < config.tokens.length - 1) {
-        logger.info('Waiting 30 seconds before processing next account...');
-        await new Promise(resolve => setTimeout(resolve, 30000));
+        logger.info('Waiting 5 seconds before processing next account...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
     
   } catch (error) {
-    logger.error(`Error during main loop: ${error.message}`);
+    logger.error(`Error in main loop: ${error.message}`);
   } finally {
     const nextTime = new Date(Date.now() + config.checkInterval);
     logger.time(`Next test cycle scheduled for: ${nextTime.toLocaleString()}`);
     logger.info(`Interval: ${Math.round(config.checkInterval / 1000 / 60)} minutes`);
-    logger.info('=== Speed test cycle complete ===\n');
+    logger.info('=== Speed Test Cycle Completed ===\n');
     setTimeout(main, config.checkInterval);
   }
 }
 
-// Handle process exit
+// Process exit handling
 process.on('SIGINT', () => {
   logger.warning('\nReceived exit signal');
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  logger.warning('\nReceived terminate signal');
+  logger.warning('\nReceived exit signal');
   process.exit(0);
 });
 
-// Start the program
+// Program start
 console.clear();
-console.log(kleur.cyan(banner));
 logger.info('Initializing Multi-Account DeSpeed Test Client...');
 initConfig().then(() => {
   main();
